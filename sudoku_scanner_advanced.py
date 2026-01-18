@@ -66,14 +66,14 @@ def warp_board(img, pts, size=450):
     warped = cv2.warpPerspective(img, M, (size, size))
     return warped, M
 
-def split_cells(warped_gray, cell_size=50):
+def split_cells(warped_gray, grid_size=9, cell_size=50):
     size = warped_gray.shape[0]
-    assert size % 9 == 0, "Warp target must be divisible by 9. Choose size like 450."
-    cell_w = size // 9
+    assert size % grid_size == 0, f"Warp target must be divisible by {grid_size}. Choose size like {grid_size * 50}."
+    cell_w = size // grid_size
     cells = []
-    for r in range(9):
+    for r in range(grid_size):
         row = []
-        for c in range(9):
+        for c in range(grid_size):
             x = c * cell_w
             y = r * cell_w
             cell = warped_gray[y:y+cell_w, x:x+cell_w]
@@ -147,22 +147,23 @@ def classify_digit(digit_img, model, use_tta=True, n_augments=3):
 cnn_model = load_model("sudoku_digit_model_attention.h5")
 
 
-def image_to_board(filepath: str):
+def image_to_board(filepath: str, grid_size: int = 9):
     img, gray, thresh = preprocess_image(filepath, debug=False)
     square_contour = find_largest_square_contour(thresh)
     if square_contour is None:
         raise ValueError("No square contour found in the image.")
 
     show_contour(img, square_contour, 'Largest Square Contour')
-    warped_color, M = warp_board(img, square_contour, size=450)
+    warp_size = grid_size * 50
+    warped_color, M = warp_board(img, square_contour, size=warp_size)
     warped_gray = cv2.cvtColor(warped_color, cv2.COLOR_BGR2GRAY)
     #show(warped_color, 'Warped Sudoku Board')
 
-    cells = split_cells(warped_gray, cell_size=450//9)
-    grid = [[0]*9 for _ in range(9)]
+    cells = split_cells(warped_gray, grid_size=grid_size, cell_size=warp_size//grid_size)
+    grid = [[0]*grid_size for _ in range(grid_size)]
 
-    for r in range(9):
-        for c in range(9):
+    for r in range(grid_size):
+        for c in range(grid_size):
             cell = cells[r][c]
             digit_img = extract_digit(cell, debug=False)
             if digit_img is None:
@@ -172,15 +173,16 @@ def image_to_board(filepath: str):
             print(f"Cell {r},{c} classified as: {val}")
             grid[r][c] = val if val is not None else "-"
 
-    print("\nExtracted Sudoku Grid:")
+    print(f"\nExtracted {grid_size}x{grid_size} Grid:")
     for row in grid:
         print(row)
 
     return grid
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Sudoku board image parser")
-    parser.add_argument("--image", required=True, help="Path to Sudoku image file")
+    parser = argparse.ArgumentParser(description="Grid-based puzzle board image parser")
+    parser.add_argument("--image", required=True, help="Path to puzzle image file")
+    parser.add_argument("--grid-size", type=int, default=9, help="Size of the grid (e.g., 9 for 9x9, 4 for 4x4)")
     args = parser.parse_args()
 
-    image_to_board(args.image)
+    image_to_board(args.image, grid_size=args.grid_size)
