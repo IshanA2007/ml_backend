@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from tensorflow.keras.models import load_model
 
+MODEL = load_model("mnist_digit_model.h5") # CHANGE THIS TO ISHAN'S MODEL
 
 def preprocess(img):
     """Convert to grayscale, denoise, threshold."""
@@ -18,100 +19,55 @@ def preprocess(img):
     return th, gray
 
 def find_boxes(binary_img, img_shape):
-    """Find contours that look like worksheet boxes using adaptive thresholds."""
     img_h, img_w = img_shape[:2]
     img_area = img_h * img_w
     
-    # Use CCOMP to get hierarchy
     cnts, hierarchy = cv2.findContours(binary_img, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    # First pass: collect all potential boxes with their properties
     candidates = []
+    
     for i, c in enumerate(cnts):
-        # Only take top-level contours (no parent)
-        if hierarchy[0][i][3] != -1:
-            continue
-        
+        # We still look for top-level boxes
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
-        
-        # Calculate relative metrics
         area_ratio = area / img_area
         aspect = w / float(h)
         
-        # Store candidate with metrics
-        candidates.append({
-            'contour': c,
-            'bbox': (x, y, w, h),
-            'area': area,
-            'area_ratio': area_ratio,
-            'aspect': aspect,
-            'perimeter': cv2.arcLength(c, True)
-        })
-    
+        # Initial loose filtering
+        if 0.005 < area_ratio < 0.20 and 0.6 < aspect < 1.6:
+            candidates.append([x, y, w, h])
+
     if not candidates:
         return []
-    
-    # Sort by area to find box-sized contours
-    candidates.sort(key=lambda x: x['area'], reverse=True)
-    
-    # Calculate statistics on the larger contours (likely boxes)
-    large_candidates = candidates[:min(10, len(candidates))]
-    areas = [c['area'] for c in large_candidates]
-    median_area = np.median(areas)
-    
-    # Filter boxes using adaptive thresholds
-    boxes = []
+
+    # --- Deduplication Logic (NMS) ---
+    # Sort by area descending so we process larger boxes first
+    candidates.sort(key=lambda b: b[2] * b[3], reverse=True)
+    final_boxes = []
+
     for cand in candidates:
-        area = cand['area']
-        area_ratio = cand['area_ratio']
-        aspect = cand['aspect']
-        x, y, w, h = cand['bbox']
+        cx, cy, cw, ch = cand
+        is_duplicate = False
         
-        # Area constraints (relative to image)
-        # Boxes should be 1-15% of image area
-        if area_ratio < 0.01 or area_ratio > 0.15:
-            continue
+        for f_box in final_boxes:
+            fx, fy, fw, fh = f_box
+            
+            # Calculate Intersection
+            ix = max(cx, fx)
+            iy = max(cy, fy)
+            iw = min(cx + cw, fx + fw) - ix
+            ih = min(cy + ch, fy + fh) - iy
+            
+            if iw > 0 and ih > 0:
+                intersection_area = iw * ih
+                # If they overlap by more than 50% of the smaller box's area, it's a double count
+                if intersection_area / (cw * ch) > 0.5:
+                    is_duplicate = True
+                    break
         
-        # Should be at least 20% of median large contour
-        if area < median_area * 0.2:
-            continue
-        
-        # Aspect ratio - boxes are roughly square
-        if aspect < 0.7 or aspect > 1.4:
-            continue
-        
-        # Check for roughly rectangular shape
-        epsilon = 0.02 * cand['perimeter']
-        approx = cv2.approxPolyDP(cand['contour'], epsilon, True)
-        if len(approx) < 4 or len(approx) > 8:
-            continue
-        
-        # Solidity check - boxes should be fairly solid (not too hollow)
-        hull = cv2.convexHull(cand['contour'])
-        hull_area = cv2.contourArea(hull)
-        if hull_area > 0:
-            solidity = area / hull_area
-            if solidity < 0.7:  # boxes should be at least 70% solid
-                continue
-        
-        # Stroke width check - boxes have thicker borders than symbols
-        # Check the border thickness by looking at the contour
-        mask = np.zeros(binary_img.shape, dtype=np.uint8)
-        cv2.drawContours(mask, [cand['contour']], -1, 255, -1)
-        
-        # Erode to estimate border thickness
-        kernel = np.ones((3,3), np.uint8)
-        eroded = cv2.erode(mask, kernel, iterations=2)
-        border_pixels = cv2.countNonZero(mask) - cv2.countNonZero(eroded)
-        border_ratio = border_pixels / area if area > 0 else 0
-        
-        # Boxes have relatively thin borders compared to their area
-        if border_ratio > 0.5:  # if more than 50% is border, it's likely a symbol
-            continue
-        
-        boxes.append((x, y, w, h))
-    
-    return boxes
+        if not is_duplicate:
+            final_boxes.append(cand)
+
+    return final_boxes
 
 def sort_boxes(boxes):
     """Sort boxes strictly left-to-right."""
@@ -243,16 +199,13 @@ def preprocess_roi_for_mnist(roi):
 
     return roi
 
-
-MODEL = load_model("mnist_digit_model.h5")
-
 def extract_polynomial_boxes(path_to_img):
     """
     Detect worksheet boxes, classify digits with CNN,
     and build a structured polynomial representation.
     """
     # 1. Detect boxes + ROIs
-    boxes, rois, _ = detect_worksheet_boxes(path_to_img)
+    boxes, rois, debug_img = detect_worksheet_boxes(path_to_img)
 
     if len(rois) == 0:
         return {
@@ -312,38 +265,119 @@ def extract_polynomial_boxes(path_to_img):
     return {
         "num_boxes": len(detections),
         "detections": detections,
-        "polynomial": polynomial
+        "polynomial": polynomial,
+        "debug_img": debug_img # for visualization (optional)
     }
 
-def is_box_empty(roi):
+def is_box_empty(roi, role="coefficient", debug=False):
+    """
+    Your exact Sudoku-based logic adapted for worksheet boxes.
+    """
+    # Ensure grayscale
     if roi.ndim == 3:
         roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
+    
     h, w = roi.shape
     total_pixels = h * w
+    
+    # 1. Blur slightly to reduce noise
+    gray = cv2.GaussianBlur(roi, (3, 3), 0)
 
-    blur = cv2.GaussianBlur(roi, (3, 3), 0)
+    # 2. Adaptive threshold
     thresh = cv2.adaptiveThreshold(
-        blur, 255,
+        gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         11, 2
     )
 
+    # 3. Remove vertical and horizontal lines (grid artifacts)
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 4, 4), 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(h // 4, 4)))
+
+    detected_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
+    thresh_no_lines = cv2.subtract(thresh, detected_h)
+
+    detected_v = cv2.morphologyEx(thresh_no_lines, cv2.MORPH_OPEN, vertical_kernel)
+    thresh_no_lines = cv2.subtract(thresh_no_lines, detected_v)
+    
+    # 4. Remove tiny specks
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    clean = cv2.morphologyEx(thresh_no_lines, cv2.MORPH_OPEN, kernel)
 
-    white_pixels = cv2.countNonZero(clean)
+    # 5. Connected components analysis
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean, connectivity=8)
+    
+    if num_labels <= 1:
+        return True
+    
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    coords = stats[1:, :4]
 
-    # Very small stroke area → empty
-    return white_pixels < max(20, total_pixels * 0.005)
+    # 6. Filter components touching the border
+    border_margin = 2
+    filtered_components = []
+    
+    for area, (bx, by, bw, bh) in zip(areas, coords):
+        if (bx > border_margin and 
+            by > border_margin and 
+            bx + bw < w - border_margin and 
+            by + bh < h - border_margin):
+            
+            if bw > 0 and bh > 0:
+                aspect_ratio = max(bw, bh) / min(bw, bh)
+                if aspect_ratio < 20.0:
+                    filtered_components.append((area, bw, bh))
+
+    if len(filtered_components) == 0:
+        white = cv2.countNonZero(clean)
+        # Threshold: Exponents (smaller) need a lower floor than coefficients
+        thresh_limit = 0.003 if role == "exponent" else 0.006
+        return white <= max(15, total_pixels * thresh_limit)
+
+    # 7. Analyze the largest valid component
+    largest_area, largest_w, largest_h = max(filtered_components, key=lambda x: x[0])
+    
+    # Adjust sensitivity based on box role
+    min_area_ratio = 0.004 if role == "exponent" else 0.006
+    
+    max_area_ratio = 0.6
+    min_dimension = max(3, min(w, h) * 0.05)
+    sum_top_n_ratio_thresh = min_area_ratio * 2
+    filtered_components_sorted = sorted([a[0] for a in filtered_components], reverse=True)
+    top_n = 2
+    sum_top_n = sum(filtered_components_sorted[:top_n]) if filtered_components_sorted else 0
+
+    if largest_area < total_pixels * min_area_ratio:
+        return True
+    if sum_top_n >= total_pixels * sum_top_n_ratio_thresh:
+        return False
+    if largest_area > total_pixels * max_area_ratio:
+        return True
+    if largest_w < min_dimension or largest_h < min_dimension:
+        return True
+    
+    return False
 
 # ========================
 # Example Usage
 # ========================
 
 if __name__ == "__main__":
-    result = extract_polynomial_boxes("worksheet_photo3.jpg")
+    image_path = "worksheet_photo.jpg"
+
+    result = extract_polynomial_boxes(image_path)
+
+    _, rois, debug_img = detect_worksheet_boxes(image_path)
+
+    if result["debug_img"] is not None:
+        cv2.imwrite("detected_boxes.png", result["debug_img"])
+        print("Success: Visualization saved as 'detected_boxes.png'")
+    
+    for i in range(len(rois)):
+        filename = f"debug_roi_{i}.jpg"
+        cv2.imwrite(filename, rois[i])
+        print(f"Saved ROI {i} to {filename}")
 
     print(f"Detected {result['num_boxes']} boxes")
 
